@@ -1,0 +1,6 @@
+services:
+  bot:
+    container_name: studybattlepassdiscordbot
+    build: .
+    volumes:
+      - .:/usr/src/app
