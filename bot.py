@@ -16,11 +16,30 @@ if not TOKEN:
 
 DB_FILE = "stats.db"
 
+# ------------------ POINTS CONFIG ------------------
 POINTS = {
-    "page": 3,
-    "problem": 10,
-    "exam_hour": 40,
+    "page": 3,           # per page read
+    "problem": 10,       # per problem/task
+    "exam_hour": 40,     # per hour of exam
 }
+
+BONUSES = {
+    "problem": {
+        "correct_first_try": 1,
+        "fixed_mistake": 1,
+    },
+    "exam": {
+        "review": 20,
+        "reflection": 10,
+        "hard_mode": 10,
+    },
+    "streak": {
+        3: 3,
+        5: 5,
+    },
+}
+
+# ------------------ RANKS ------------------
 
 RANKS = [
     (0, "Bronze"),
@@ -121,9 +140,9 @@ def update_streak(user_id):
 
 def streak_bonus(streak):
     if streak >= 5:
-        return 5
+        return BONUSES["streak"][5]
     if streak >= 3:
-        return 3
+        return BONUSES["streak"][3]
     return 0
 
 # ------------------ WEEKLY FREEZE RESET ------------------
@@ -208,28 +227,101 @@ async def on_ready():
         daily_streak_reminder.start()
     print(f"✅ Logged in as {bot.user}")
 
+# ------------------ /LOG ------------------
 
-# ------------------ /REMINDER ------------------
-@bot.tree.command(name="reminder", description="Enable or disable daily streak reminders")
-@app_commands.describe(option="on / off")
-async def reminder(interaction: discord.Interaction, option: str):
+@bot.tree.command(name="log", description="Log study activity")
+@app_commands.describe(
+    activity="page / problem / exam",
+    amount="Pages, problems, or exam hours",
+    correct_first_try=f"Problems only: +{BONUSES['problem']['correct_first_try']} per correct first try",
+    fixed_mistake=f"Problems only: +{BONUSES['problem']['fixed_mistake']} per fixed mistake",
+    review=f"Exams only: +{BONUSES['exam']['review']} for review & corrections",
+    reflection=f"Exams only: +{BONUSES['exam']['reflection']} for reflection notes",
+    hard_mode=f"Exams only: +{BONUSES['exam']['hard_mode']} for hard mode"
+)
+async def log(
+    interaction: discord.Interaction,
+    activity: str,
+    amount: int,
+    correct_first_try: int = 0,
+    fixed_mistake: int = 0,
+    review: int = 0,
+    reflection: int = 0,
+    hard_mode: int = 0
+):
+    activity = activity.lower()
     ensure_user(interaction.user.id)
-    option = option.lower()
-    if option not in ("on", "off"):
-        await interaction.response.send_message("❌ Option must be 'on' or 'off'", ephemeral=True)
-        return
+    streak = update_streak(interaction.user.id)
+    streak_pts = streak_bonus(streak)
 
-    value = 1 if option == "on" else 0
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("UPDATE users SET daily_reminder=? WHERE user_id=?", (value, interaction.user.id))
+
+    total_bonus = 0
+    if activity == "page":
+        points = amount * POINTS["page"] + streak_pts
+        total_bonus += streak_pts
+        cursor.execute("UPDATE users SET pages_read=pages_read+?, points=points+? WHERE user_id=?", (amount, points, interaction.user.id))
+    elif activity == "problem":
+        bonus_points = (correct_first_try * BONUSES["problem"]["correct_first_try"] +
+                        fixed_mistake * BONUSES["problem"]["fixed_mistake"])
+        points = amount * POINTS["problem"] + bonus_points + streak_pts
+        total_bonus += bonus_points + streak_pts
+        cursor.execute("UPDATE users SET problems_solved=problems_solved+?, points=points+? WHERE user_id=?", (amount, points, interaction.user.id))
+    elif activity == "exam":
+        bonus_points = (review * BONUSES["exam"]["review"] +
+                        reflection * BONUSES["exam"]["reflection"] +
+                        hard_mode * BONUSES["exam"]["hard_mode"])
+        points = amount * POINTS["exam_hour"] + bonus_points + streak_pts
+        total_bonus += bonus_points + streak_pts
+        cursor.execute("UPDATE users SET exam_hours=exam_hours+?, points=points+? WHERE user_id=?", (amount, points, interaction.user.id))
+    else:
+        await interaction.response.send_message("❌ Invalid activity", ephemeral=True)
+        return
+
+    cursor.execute("SELECT pages_read, problems_solved, exam_hours FROM users WHERE user_id=?", (interaction.user.id,))
+    pages, probs, hours = cursor.fetchone()
+    milestone_msgs = check_milestones(cursor, interaction.user.id, pages, probs, hours)
+
     conn.commit()
     conn.close()
 
-    await interaction.response.send_message(f"✅ Daily reminder turned **{option.upper()}**")
+    embed = discord.Embed(title=f"📌 Activity Logged: {activity.capitalize()}", color=discord.Color.blue())
+    embed.add_field(name="Amount", value=str(amount), inline=True)
+    embed.add_field(name="Base Points", value=str(amount * POINTS.get(f"{activity if activity != 'exam' else 'exam_hour'}", 0)), inline=True)
+    embed.add_field(name="Bonus Points", value=str(total_bonus), inline=True)
+    embed.add_field(name="Streak", value=f"{streak} (+{streak_pts})", inline=True)
+    embed.add_field(name="Total Points Gained", value=str(points), inline=False)
+    if milestone_msgs:
+        embed.add_field(name="🎉 Milestones Unlocked", value="\n".join(milestone_msgs), inline=False)
 
+    await interaction.response.send_message(embed=embed)
+
+# ------------------ /DAILY ------------------
+
+@bot.tree.command(name="daily", description="View today’s summary & streak status")
+async def daily(interaction: discord.Interaction):
+    ensure_user(interaction.user.id)
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT streak, freezes, last_activity FROM users WHERE user_id=?", (interaction.user.id,))
+    streak, freezes, last = cursor.fetchone()
+    conn.close()
+
+    today = date.today()
+    logged_today = last == today.isoformat()
+
+    embed = discord.Embed(title="📅 Daily Summary", color=discord.Color.blue())
+    embed.add_field(name="🔥 Streak", value=f"{streak} days (+{streak_bonus(streak)}/log)", inline=False)
+    embed.add_field(name="❄️ Freezes", value=str(freezes), inline=True)
+    embed.add_field(name="📌 Status", value="✅ Logged today" if logged_today else "⚠️ Not logged yet", inline=True)
+    if not logged_today:
+        embed.set_footer(text="Log something today to protect your streak!")
+
+    await interaction.response.send_message(embed=embed)
 
 # ------------------ /STATS ------------------
+
 @bot.tree.command(name="stats", description="View your stats")
 async def stats(interaction: discord.Interaction):
     ensure_user(interaction.user.id)
@@ -255,99 +347,8 @@ async def stats(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed)
 
-# ------------------ /LOG ------------------
-@bot.tree.command(name="log", description="Log study activity")
-@app_commands.describe(
-    activity="page / problem / exam",
-    amount="Pages, problems, or exam hours",
-    correct_first_try="Problems only: +1 point per correct first try",
-    fixed_mistake="Problems only: +1 point per fixed mistake",
-    review="Exams only: +20 review & corrections",
-    reflection="Exams only: +10 reflection notes",
-    hard_mode="Exams only: +10 hard mode"
-)
-async def log(
-    interaction: discord.Interaction,
-    activity: str,
-    amount: int,
-    correct_first_try: int = 0,
-    fixed_mistake: int = 0,
-    review: int = 0,
-    reflection: int = 0,
-    hard_mode: int = 0
-):
-    activity = activity.lower()
-    ensure_user(interaction.user.id)
-    streak = update_streak(interaction.user.id)
-    streak_pts = streak_bonus(streak)
-
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    # calculate bonus points
-    bonus_points = 0
-    if activity == "problem":
-        bonus_points = correct_first_try + fixed_mistake
-        points = amount * POINTS["problem"] + bonus_points + streak_pts
-        cursor.execute("UPDATE users SET problems_solved=problems_solved+?, points=points+? WHERE user_id=?", (amount, points, interaction.user.id))
-    elif activity == "exam":
-        bonus_points = review + reflection + hard_mode
-        points = amount * POINTS["exam_hour"] + bonus_points + streak_pts
-        cursor.execute("UPDATE users SET exam_hours=exam_hours+?, points=points+? WHERE user_id=?", (amount, points, interaction.user.id))
-    elif activity == "page":
-        points = amount * POINTS["page"] + streak_pts
-        cursor.execute("UPDATE users SET pages_read=pages_read+?, points=points+? WHERE user_id=?", (amount, points, interaction.user.id))
-    else:
-        await interaction.response.send_message("❌ Invalid activity", ephemeral=True)
-        return
-
-    # milestones
-    cursor.execute("SELECT pages_read, problems_solved, exam_hours FROM users WHERE user_id=?", (interaction.user.id,))
-    pages, probs, hours = cursor.fetchone()
-    milestone_msgs = check_milestones(cursor, interaction.user.id, pages, probs, hours)
-
-    conn.commit()
-    conn.close()
-
-    # embed visualization
-    embed = discord.Embed(
-        title=f"📌 Activity Logged: {activity.capitalize()}",
-        color=discord.Color.blue()
-    )
-    embed.add_field(name="Amount", value=str(amount), inline=True)
-    embed.add_field(name="Base Points", value=str(amount * POINTS.get(f"{activity if activity != 'exam' else 'exam_hour'}", 0)), inline=True)
-    embed.add_field(name="Bonus Points", value=str(bonus_points + streak_pts), inline=True)
-    embed.add_field(name="Streak", value=f"{streak} (+{streak_pts})", inline=True)
-    embed.add_field(name="Total Points Gained", value=str(points), inline=False)
-
-    if milestone_msgs:
-        embed.add_field(name="🎉 Milestones Unlocked", value="\n".join(milestone_msgs), inline=False)
-
-    await interaction.response.send_message(embed=embed)
-
-# ------------------ /DAILY ------------------
-@bot.tree.command(name="daily", description="View today’s summary & streak status")
-async def daily(interaction: discord.Interaction):
-    ensure_user(interaction.user.id)
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT streak, freezes, last_activity FROM users WHERE user_id=?", (interaction.user.id,))
-    streak, freezes, last = cursor.fetchone()
-    conn.close()
-
-    today = date.today()
-    logged_today = last == today.isoformat()
-
-    embed = discord.Embed(title="📅 Daily Summary", color=discord.Color.blue())
-    embed.add_field(name="🔥 Streak", value=f"{streak} days (+{streak_bonus(streak)}/log)", inline=False)
-    embed.add_field(name="❄️ Freezes", value=str(freezes), inline=True)
-    embed.add_field(name="📌 Status", value="✅ Logged today" if logged_today else "⚠️ Not logged yet", inline=True)
-    if not logged_today:
-        embed.set_footer(text="Log something today to protect your streak!")
-
-    await interaction.response.send_message(embed=embed)
-
 # ------------------ /MILESTONES ------------------
+
 @bot.tree.command(name="milestones", description="View your milestone progress")
 async def milestones(interaction: discord.Interaction):
     ensure_user(interaction.user.id)
@@ -375,6 +376,24 @@ async def milestones(interaction: discord.Interaction):
     section("🏆 Exams", hours, EXAM_MILESTONES)
 
     await interaction.response.send_message(embed=embed)
+
+# ------------------ /REMINDER ------------------
+
+@bot.tree.command(name="reminder", description="Enable or disable daily streak reminders")
+@app_commands.describe(option="on / off")
+async def reminder(interaction: discord.Interaction, option: str):
+    ensure_user(interaction.user.id)
+    option = option.lower()
+    if option not in ("on", "off"):
+        await interaction.response.send_message("❌ Option must be 'on' or 'off'", ephemeral=True)
+        return
+    value = 1 if option == "on" else 0
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET daily_reminder=? WHERE user_id=?", (value, interaction.user.id))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(f"✅ Daily reminder turned **{option.upper()}**")
 
 # ------------------ START ------------------
 
